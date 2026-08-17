@@ -1,0 +1,14 @@
+# Runtime artifacts (created when the server runs)
+wechat_models/
+mcp_server.log
+*.log
+
+# Downloaded / cached model weights
+*.pt
+*.caffemodel
+*.prototxt
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
