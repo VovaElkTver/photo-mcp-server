@@ -12,3 +12,6 @@ mcp_server.log
 __pycache__/
 *.py[cod]
 .pytest_cache/
+
+# Test byproducts (created by align_perspective during tests)
+test-imgs/*_aligned.png
