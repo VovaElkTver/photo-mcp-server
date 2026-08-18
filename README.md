@@ -2,18 +2,20 @@
 
 Асинхронный **MCP-сервер** (Model Context Protocol) для фотофиксационного анализа
 1D/2D-кодов (QR, DataMatrix, штрихкоды). Сервер отдаёт три инструмента LLM-хосту
-по транспорту `stdio`, а локальная модель (vLLM) решает, какие инструменты
-вызвать, и получает реальные результаты — не догадки.
+по транспорту **SSE** (сеть, `0.0.0.0:8000`), а локальная модель (vLLM) решает,
+какие инструменты вызвать, и получает реальные результаты — не догадки.
+Транспорт SSE (вместо stdio) нужен для удалённого выполнения: vLLM может
+подключиться к серверу через Responses API (`--tool-server`).
 
 ```
-+------------------+        stdio (JSON-RPC)        +------------------+
-|  LLM host (vLLM) |  <---- MCP tools/call ------>  | photo_mcp_server |
-|  Inferact/Qwen3.8|  <---- results ----------  |  | (FastMCP)       |
-|  -27B-NVFP4 :8001|                              +------------------+
- +------------------+                                      |
-                                                          | detect_code (YOLO)
-                                                          | align_perspective (cv2)
-                                                          | decode_code (cascade)
++------------------+         SSE (HTTP / JSON-RPC)        +------------------+
+|  LLM host (vLLM) |  <---- tools/call (/messages/) ->  | photo_mcp_server |
+|  Inferact/Qwen3.8|  <---- results (/sse) ---------  |  | (FastMCP :8000)|
+|  -27B-NVFP4 :8001|                                   +------------------+
+ +------------------+                                        |
+                                                            | detect_code (YOLO)
+                                                            | align_perspective (cv2)
+                                                            | decode_code (cascade)
 ```
 
 ---
@@ -22,7 +24,7 @@
 
 | Файл | Назначение |
 |------|-----------|
-| `photo_mcp_server.py` | MCP-сервер (FastMCP, stdio). 3 инструмента. |
+| `photo_mcp_server.py` | MCP-сервер (FastMCP, SSE, `0.0.0.0:8000`). 3 инструмента. |
 | `test_mcp_model.py`   | Тест-скрипт: MCP-агент, где модель на 8001 вызывает инструменты на картинках из `test-imgs/`. |
 | `test-imgs/`          | Исходные фото с кодами (тестовые образцы). |
 | `wechat_models/`      | Авто-скачанные модели WeChatQRCode (создаются при первом вызове). |
@@ -56,8 +58,9 @@ pip install "pyzbar"
 
 ## 3. Запуск MCP-сервера
 
-Сервер — это FastMCP-апп по stdio. **stdout** — канал MCP-протокола, поэтому весь
-лог идёт в `stderr` и в `mcp_server.log` (никогда не через `print`).
+Сервер — это FastMCP-апп по **SSE** (HTTP). Он слушает `0.0.0.0:8000`
+(эндпоинты `/sse` — GET для потока, `/messages/` — POST для JSON-RPC).
+Весь лог идёт в `stderr` и в `mcp_server.log` (никогда не через `print`).
 
 ### 3.1. Прямой запуск (вручную)
 ```bash
@@ -67,22 +70,26 @@ python3 photo_mcp_server.py
 Вывод в stderr:
 ```
 ... photo-mcp-server ready (device=cuda, cv_backend=cpu)
+Uvicorn running on http://0.0.0.0:8000
 ```
-Сервер остаётся живым, ожидая MCP-клиента на stdin.
+Сервер остаётся живым, ожидая MCP-клиента по SSE на `http://<host>:8000/sse`.
+(В mcp 1.29.0 `host`/`port` задаются в конструкторе `FastMCP(...)`, а не в
+`mcp.run(transport="sse")` — `run()` принимает только `transport`/`mount_path`.)
 
 ### 3.2. Подключение из MCP-клиента (Claude Desktop, IDE, свой клиент)
-В конфигурации MCP-клиента — stdio-команда:
+Сервер — сетевой (SSE), поэтому в конфигурации MCP-клиента указывают URL
+(не stdio-команду):
 ```json
 {
   "mcpServers": {
     "photo-mcp-server": {
-      "command": "python3",
-      "args": ["/home/ps/photo-mcp-server/photo_mcp_server.py"],
-      "env": { "PYTHONPATH": "/home/ps/photo-mcp-server" }
+      "url": "http://127.0.0.1:8000/sse"
     }
   }
 }
 ```
+Для удалённого хоста (например, vLLM Responses API `--tool-server`) замените
+`127.0.0.1` на адрес сервера — он уже привязан к `0.0.0.0`.
 
 ### 3.3. Что происходит при старте
 - Авто-выбор ускорения: **CUDA → MPS → CPU** (`_detect_device`).
@@ -145,11 +152,19 @@ vllm serve Inferact/Qwen3.8-27B-NVFP4 \
 
 Тест — **MCP-агент**: модель на 8001 «мозг», `photo_mcp_server.py` — инструменты,
 картинки из `test-imgs/` — вход. Для каждой картинки:
-1. Запускается `photo_mcp_server.py` (stdio, JSON-RPC handshake).
-2. Схемы инструментов конвертируются в OpenAI function-call формат.
-3. Модель получает промпт + инструменты и **сама** решает, какие вызвать.
-4. Каждый `tool_call` исполняется на MCP-сервере, результат уходит обратно модели.
-5. Модель выдаёт итоговый ответ (расшифрованные значения / «код не найден»).
+1. Запускается `photo_mcp_model.py` (SSE-сервер на `:8000`).
+2. Клиент подключается по SSE (`/sse` → `/messages/`), делает JSON-RPC handshake
+   (initialize) и получает список инструментов.
+3. Схемы инструментов конвертируются в OpenAI function-call формат.
+4. Модель получает промпт + инструменты и **сама** решает, какие вызвать.
+5. Каждый `tool_call` исполняется на MCP-сервере, результат уходит обратно модели.
+6. Модель выдаёт итоговый ответ (расшифрованные значения / «код не найден»).
+
+> **Замечание:** тест использует **сырой JSON-RPC-клиент по SSE** (класс
+> `RawSseClient` в скрипте), а не `mcp.ClientSession`. С этим FastMCP 1.29.0
+> сервером `ClientSession` не завершает рукопожатие
+> (`McpError: Invalid request parameters`), тогда как сырой JSON-RPC по SSE
+> работает надёжно.
 
 ### 5.1. Запуск
 ```bash
@@ -181,11 +196,6 @@ MCP tools available: ['detect_code', 'align_perspective', 'decode_code']
      -> {"status": "success", "results": [{"format": "QR", "text": "ELK00000028956"}, {"format": "QR", "text": "0AGN3K3Y901930N"}]}
   RESULT: ... decoded two QR codes: ELK00000028956, 0AGN3K3Y901930N
 ```
-
-> **Замечание:** тест использует **сырой JSON-RPC клиент** (а не
-> `mcp.ClientSession`) — с этим FastMCP-сервером `ClientSession` не завершал
-> рукопожатие (`Received request before initialization was complete`), тогда как
-> сырой JSON-RPC работает надёжно.
 
 ---
 
@@ -246,8 +256,9 @@ appropriate. Report the decoded values, or state clearly that no code was found.
 | `WeChatQRCode` SystemError / нет InferenceEngine | Поставьте `opencv-contrib-python==4.14.0.94` (не 5.0). |
 | `pylibdmtx` нет `decode` | Поставьте `pylibdmtx==0.1.9` (не 0.1.10). |
 | Конфликт `opencv-python`/`opencv-contrib-python` | `pip install --force-reinstall --no-deps opencv-contrib-python`. |
-| Сервер «не отвечает» по stdio | Смотрите `mcp_server.log` / stderr; stdout зарезервирован под протокол. |
-| `Received request before initialization was complete` | Используйте сырой JSON-RPC (как в тесте), а не `mcp.ClientSession`. |
+| `FastMCP.run() got an unexpected keyword argument 'host'` | В mcp 1.29.0 `host`/`port` задают в конструкторе `FastMCP(host=..., port=...)`, а не в `run(transport="sse")`. |
+| `McpError: Invalid request parameters` (ClientSession) | Используйте сырой JSON-RPC по SSE (как в `test_mcp_model.py`), а не `mcp.ClientSession`. |
+| Сервер «не отвечает» по SSE | Смотрите `mcp_server.log` / stderr; проверьте, что `Uvicorn running on http://0.0.0.0:8000`. |
 | 404 при скачивании моделей | Проверьте интернет; модели кэшируются в `wechat_models/` и рядом с сервером. |
 
 ---

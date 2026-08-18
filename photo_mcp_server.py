@@ -24,8 +24,10 @@ import json
 import logging
 import asyncio
 import threading
+import tempfile
+import base64
 import urllib.request
-from typing import Any
+from typing import Any, Optional
 
 import numpy as np
 
@@ -231,8 +233,12 @@ def _create_wechat_detector():
         _set_cv_backend(backend)
         for kwargs in arg_sets:
             try:
+                # Pass the super-resolution (sr) models too so the neural
+                # up-scale path is enabled; the **kwargs below keeps the
+                # constructor tolerant of version differences.
                 detector = cv2.wechat_qrcode_WeChatQRCode(
-                    DETECT_PROTO, DETECT_CAFFE, **kwargs
+                    DETECT_PROTO, DETECT_CAFFE,
+                    SR_PROTO, SR_CAFFE, **kwargs
                 )
                 logger.info(
                     "WeChatQRCode initialised (backend '%s', %d extra args)",
@@ -288,6 +294,44 @@ def _load_yolo_model():
 # Image helpers
 # --------------------------------------------------------------------------- #
 def _read_image(path: str):
+    """Load an image from a local path, an HTTP/HTTPS URL, or a Base64
+    Data URI. Returns a BGR numpy array; raises ValueError on failure.
+
+    Because the MCP server may run remotely (e.g. behind vLLM --tool-server),
+    ``path`` is no longer assumed to be a local file: it can be an HTTP/HTTPS
+    URL or a Base64 / Data URI. All three cases are decoded in memory via
+    ``cv2.imdecode``; the local case keeps using ``cv2.imread``.
+    """
+    # 1. Remote HTTP/HTTPS URL: download into memory, decode via cv2.imdecode.
+    if path.startswith("http://") or path.startswith("https://"):
+        try:
+            with urllib.request.urlopen(path, timeout=60) as response:
+                raw = response.read()
+        except Exception as _e:  # pragma: no cover
+            raise ValueError(f"Cannot download image from '{path}': {_e}")
+        buf = np.frombuffer(raw, dtype=np.uint8)
+        img = cv2.imdecode(buf, cv2.IMREAD_COLOR)
+        if img is None:
+            raise ValueError(f"Cannot decode image from URL '{path}'")
+        return img
+
+    # 2. Base64 / Data URI (e.g. "data:image/jpeg;base64,..." or a bare
+    #    base64 string, detectable by "data:image" or image markers like
+    #    "/9j/"). Strip the "data:...;base64," prefix if a comma is present,
+    #    decode, then read via cv2.imdecode.
+    if "data:image" in path.lower() or "/9j/" in path:
+        b64 = path.split(",", 1)[1] if "," in path else path
+        try:
+            raw = base64.b64decode(b64, validate=False)
+        except Exception as _e:  # pragma: no cover
+            raise ValueError(f"Cannot base64-decode image data: {_e}")
+        buf = np.frombuffer(raw, dtype=np.uint8)
+        img = cv2.imdecode(buf, cv2.IMREAD_COLOR)
+        if img is None:
+            raise ValueError("Cannot decode image from Base64 data")
+        return img
+
+    # 3. Local file path.
     img = cv2.imread(path, cv2.IMREAD_COLOR)
     if img is None:
         raise ValueError(f"Cannot read image at '{path}' (missing or corrupted)")
@@ -384,7 +428,13 @@ def _zxing_decode(image):
 def _libdmtx_decode(image):
     import pylibdmtx
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    results = pylibdmtx.decode(gray)
+    # Mandatory binarisation before pylibdmtx.decode(): libdmtx decoders
+    # work on a binary image, so an adaptiveThreshold step sharply improves
+    # DataMatrix decoding on noisy / low-contrast captures.
+    binary = cv2.adaptiveThreshold(
+        gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 21, 2
+    )
+    results = pylibdmtx.decode(binary)
     decoded = []
     for r in results:
         text = _to_text(getattr(r, "data", "")).strip()
@@ -501,7 +551,9 @@ def _run_align(image_path: str, corners, output_size: int = 300):
     warped = cv2.warpPerspective(image, M, (output_size, output_size))
 
     base = os.path.splitext(image_path)[0]
-    saved_path = f"{base}_aligned.png"
+    # Save to the system temp dir so the project tree is not littered with
+    # *_aligned.png artifacts.
+    saved_path = os.path.join(tempfile.gettempdir(), f"{base}_aligned.png")
     if not cv2.imwrite(saved_path, warped):
         raise RuntimeError(f"Could not write aligned image to '{saved_path}'")
     return {"status": "success", "saved_path": saved_path}
@@ -517,7 +569,11 @@ def _run_decode(image_path: str, bbox=None):
 # --------------------------------------------------------------------------- #
 # MCP tools
 # --------------------------------------------------------------------------- #
-mcp = FastMCP("photo-mcp-server")
+# Host/port are set here (FastMCP constructor), NOT in run(): in mcp 1.29.0
+# run() only takes transport/mount_path; the uvicorn server reads
+# self.settings.host/port. Bind to 0.0.0.0 so a remote vLLM instance can reach
+# the SSE endpoint.
+mcp = FastMCP("photo-mcp-server", host="0.0.0.0", port=8000)
 
 
 @mcp.tool()
@@ -525,7 +581,7 @@ async def detect_code(image_path: str) -> str:
     """Detect barcode / QR / DataMatrix objects with YOLO.
 
     Args:
-        image_path: Path to the input image.
+        image_path: Local file path, HTTP/HTTPS URL, or Base64 Data URI.
 
     Returns:
         JSON string: {"status": "success",
@@ -548,7 +604,7 @@ async def align_perspective(image_path: str, corners: list, output_size: int = 3
     """Rectify a code region using its 4 corners via a perspective transform.
 
     Args:
-        image_path: Path to the input image.
+        image_path: Local file path, HTTP/HTTPS URL, or Base64 Data URI.
         corners: Four corner points as [[x, y], [x, y], [x, y], [x, y]]
             (any order; sorted internally).
         output_size: Side length (pixels) of the square output.
@@ -567,12 +623,12 @@ async def align_perspective(image_path: str, corners: list, output_size: int = 3
 
 
 @mcp.tool()
-async def decode_code(image_path: str, bbox: list = None) -> str:
+async def decode_code(image_path: str, bbox: Optional[list] = None) -> str:
     """Decode 1D/2D codes via a strict cascade
     (WeChatQRCode -> zxing-cpp -> pylibdmtx -> pyzbar).
 
     Args:
-        image_path: Path to the input image.
+        image_path: Local file path, HTTP/HTTPS URL, or Base64 Data URI.
         bbox: Optional ROI [x1, y1, x2, y2]; the image is cropped first.
 
     Returns:
@@ -604,4 +660,8 @@ if __name__ == "__main__":
         _startup()
     except Exception as _e:  # pragma: no cover
         logger.exception("Startup failed: %s", _e)
-    mcp.run(transport="stdio")
+    # Run as a standalone network service so a remote vLLM instance can reach
+    # it via the Responses API (--tool-server). SSE is used instead of stdio;
+    # the host/port were set in the FastMCP constructor above (run() only
+    # accepts transport/mount_path in mcp 1.29.0).
+    mcp.run(transport="sse")
